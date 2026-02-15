@@ -1,0 +1,38 @@
+# =============================================================================
+# RL Development Stack — February 2026
+# Target: Windows 11 | NVIDIA RTX 4090 | Driver 591.86 | CUDA 13.1
+# Python: 3.12 recommended (3.10+ required)
+# Package Manager: uv
+# =============================================================================
+#
+# INSTALL:
+#   uv pip install -r requirements.txt --torch-backend=cu130
+#
+# =============================================================================
+
+# --- Core Deep Learning ---
+torch==2.9.1
+torchvision==0.24.1
+numpy>=2.0,<3
+
+# --- RL Environments ---
+gymnasium[atari,classic-control]==1.2.3
+
+# --- RL Libraries ---
+stable-baselines3==2.7.1
+torchrl==0.11.1
+
+# --- Hyperparameter Tuning / Distributed ---
+ray[tune]==2.53.0
+
+# --- Training Utilities ---
+pytorch-ignite==0.5.1
+tensorboard==2.18.0
+
+# --- Video / Image Processing ---
+moviepy<2.0.0
+opencv-python>=4.10,<5
+
+# --- Code Quality / Testing ---
+mypy>=1.8,<2
+pytest>=9.0.2
