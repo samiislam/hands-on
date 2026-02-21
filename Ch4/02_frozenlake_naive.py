@@ -103,7 +103,9 @@ def filter_batch(batch: list[Episode], percentile: float) -> \
 
 if __name__ == "__main__":
     env = DiscreteOneHotWrapper(gym.make("FrozenLake-v1"))
+    assert env.observation_space.shape is not None
     obs_size = env.observation_space.shape[0]
+    assert isinstance(env.action_space, gym.spaces.Discrete)
     n_actions = int(env.action_space.n)
 
     net = Net(obs_size, HIDDEN_SIZE, n_actions)

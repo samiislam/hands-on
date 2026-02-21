@@ -1,28 +1,31 @@
 #!/usr/bin/env python3
-import typing as tt
 import gymnasium as gym
 from collections import defaultdict, Counter
 from torch.utils.tensorboard.writer import SummaryWriter
 
-ENV_NAME = "FrozenLake-v1"
-#ENV_NAME = "FrozenLake8x8-v1"      # uncomment for larger version
+#ENV_NAME = "FrozenLake-v1"
+ENV_NAME = "FrozenLake8x8-v1"      # uncomment for larger version
 GAMMA = 0.9
 TEST_EPISODES = 20
 
 State = int
 Action = int
-RewardKey = tt.Tuple[State, Action, State]
-TransitKey = tt.Tuple[State, Action]
+RewardKey = tuple[State, Action, State]
+TransitKey = tuple[State, Action]
 
 
 class Agent:
     def __init__(self):
         self.env = gym.make(ENV_NAME)
+        assert isinstance(self.env.action_space, gym.spaces.Discrete)
+        assert isinstance(self.env.observation_space, gym.spaces.Discrete)
+        self.n_actions: int = int(self.env.action_space.n)
+        self.n_states: int = int(self.env.observation_space.n)
         self.state, _ = self.env.reset()
-        self.rewards: tt.Dict[RewardKey, float] = defaultdict(float)
-        self.transits: tt.Dict[TransitKey, Counter] = \
+        self.rewards: dict[RewardKey, float] = defaultdict(float)
+        self.transits: dict[TransitKey, Counter] = \
             defaultdict(Counter)
-        self.values: tt.Dict[TransitKey, float] = defaultdict(float)
+        self.values: dict[TransitKey, float] = defaultdict(float)
 
     def play_n_random_steps(self, n: int):
         for _ in range(n):
@@ -39,12 +42,14 @@ class Agent:
                 self.state = new_state
 
     def select_action(self, state: State) -> Action:
-        best_action, best_value = None, None
-        for action in range(self.env.action_space.n):
+        best_action: Action | None = None
+        best_value: float | None = None
+        for action in range(self.n_actions):
             action_value = self.values[(state, action)]
             if best_value is None or best_value < action_value:
                 best_value = action_value
                 best_action = action
+        assert best_action is not None
         return best_action
 
     def play_episode(self, env: gym.Env) -> float:
@@ -58,15 +63,15 @@ class Agent:
             self.rewards[rw_key] = float(reward)
             tr_key = (state, action)
             self.transits[tr_key][new_state] += 1
-            total_reward += reward
+            total_reward += float(reward)
             if is_done or is_trunc:
                 break
             state = new_state
         return total_reward
 
     def value_iteration(self):
-        for state in range(self.env.observation_space.n):
-            for action in range(self.env.action_space.n):
+        for state in range(self.n_states):
+            for action in range(self.n_actions):
                 action_value = 0.0
                 target_counts = self.transits[(state, action)]
                 total = sum(target_counts.values())
@@ -80,7 +85,8 @@ class Agent:
 
 
 if __name__ == "__main__":
-    test_env = gym.make(ENV_NAME)
+    test_env = gym.make(ENV_NAME, render_mode="rgb_array")
+    test_env = gym.wrappers.RecordVideo(test_env, video_folder="video")
     agent = Agent()
     writer = SummaryWriter(comment="-q-iteration")
 
@@ -88,7 +94,7 @@ if __name__ == "__main__":
     best_reward = 0.0
     while True:
         iter_no += 1
-        agent.play_n_random_steps(100)
+        agent.play_n_random_steps(1000)
         agent.value_iteration()
 
         reward = 0.0

@@ -1,7 +1,7 @@
 import numpy as np
 import gymnasium as gym
 from dataclasses import dataclass
-from collections.abc import Generator
+from collections.abc import Iterator
 
 from torch.utils.tensorboard.writer import SummaryWriter
 import torch
@@ -38,8 +38,8 @@ class Episode:
     steps: list[EpisodeStep]
 
 
-def iterate_batches(env: gym.Env, net: Net, batch_size: int) -> Generator[list[Episode], None, None]:
-    batch = []
+def iterate_batches(env: gym.Env, net: Net, batch_size: int) -> Iterator[list[Episode]]:
+    batch: list[Episode] = []
     episode_reward = 0.0
     episode_steps = []
     obs, _ = env.reset()
@@ -48,6 +48,7 @@ def iterate_batches(env: gym.Env, net: Net, batch_size: int) -> Generator[list[E
         obs_v = torch.tensor(obs, dtype=torch.float32)
         act_probs_v = sm(net(obs_v.unsqueeze(0)))
         act_probs = act_probs_v.data.numpy()[0]
+
         action = np.random.choice(len(act_probs), p=act_probs)
         next_obs, reward, is_done, is_trunc, _ = env.step(action)
         episode_reward += float(reward)
@@ -100,11 +101,11 @@ if __name__ == "__main__":
 
     for iter_no, batch in enumerate(iterate_batches(env, net, BATCH_SIZE)):
         obs_v, acts_v, reward_b, reward_m = filter_batch(batch, PERCENTILE)
-        optimizer.zero_grad()
-        action_scores_v = net(obs_v)
-        loss_v = objective(action_scores_v, acts_v)
-        loss_v.backward()
-        optimizer.step()
+        optimizer.zero_grad() # Clear old gradients
+        action_scores_v = net(obs_v) # forward pass
+        loss_v = objective(action_scores_v, acts_v) # forward pass
+        loss_v.backward() # backward pass - compute new gradients
+        optimizer.step() # update weights using the computed gradients
         print("%d: loss=%.3f, reward_mean=%.1f, rw_bound=%.1f" % (
             iter_no, loss_v.item(), reward_m, reward_b))
         writer.add_scalar("loss", loss_v.item(), iter_no)
