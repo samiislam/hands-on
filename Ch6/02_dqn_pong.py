@@ -11,7 +11,7 @@ import collections
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.cuda.amp import GradScaler
+from torch.amp import GradScaler
 from typing import cast
 
 from torch.utils.tensorboard.writer import SummaryWriter
@@ -27,7 +27,9 @@ LEARNING_RATE = 1e-4
 SYNC_TARGET_FRAMES = 1000
 REPLAY_START_SIZE = 10000
 
-EPSILON_DECAY_LAST_FRAME = 150000
+N_ENVS = 8  # try 16 if GPU is still the bottleneck
+
+EPSILON_DECAY_LAST_FRAME = 150000 * N_ENVS
 EPSILON_START = 1.0
 EPSILON_FINAL = 0.01
 
@@ -66,45 +68,54 @@ class ExperienceBuffer:
 
 
 class Agent:
-    def __init__(self, env: gym.Env, exp_buffer: ExperienceBuffer):
+    def __init__(self, env: gym.vector.VectorEnv, exp_buffer: ExperienceBuffer):
         self.env = env
         self.exp_buffer = exp_buffer
-        self.state: np.ndarray | None = None
+        self.states: np.ndarray | None = None
+        self.total_rewards = np.zeros(N_ENVS)
         self._reset()
 
     def _reset(self):
-        self.state, _ = self.env.reset()
-        self.total_reward = 0.0
+        self.states, _ = self.env.reset()
+        self.total_rewards = np.zeros(N_ENVS)
 
     @torch.no_grad()
     def play_step(self, net: dqn_model.DQN, device: torch.device,
-                  epsilon: float = 0.0) -> float | None:
-        assert self.state is not None
-        done_reward = None
+                  epsilon: float = 0.0) -> list[float]:
+        assert self.states is not None
+        done_rewards: list[float] = []
 
         if np.random.random() < epsilon:
-            action = self.env.action_space.sample()
+            actions = self.env.action_space.sample()
         else:
-            state_v = torch.as_tensor(self.state).to(device)
-            state_v.unsqueeze_(0)
-            q_vals_v = net(state_v)
+            torch.compiler.cudagraph_mark_step_begin()
+            states_v = torch.as_tensor(self.states).to(device)
+            q_vals_v = net(states_v)
             _, act_v = torch.max(q_vals_v, dim=1)
-            action = int(act_v.item())
+            actions = act_v.cpu().numpy()
 
-        # do step in the environment
-        new_state, reward, is_done, is_tr, _ = self.env.step(action)
-        self.total_reward += float(reward)
+        new_states, rewards, is_done, is_tr, infos = self.env.step(actions)
+        self.total_rewards += rewards
 
-        exp = Experience(
-            state=self.state, action=action, reward=float(reward),
-            done_trunc=is_done or is_tr, new_state=new_state
-        )
-        self.exp_buffer.append(exp)
-        self.state = new_state
-        if is_done or is_tr:
-            done_reward = self.total_reward
-            self._reset()
-        return done_reward
+        for i in range(N_ENVS):
+            done_trunc = bool(is_done[i]) or bool(is_tr[i])
+            # VectorEnv autoreset: new_states[i] is the first obs of the next
+            # episode when done. The true final obs is stored in infos.
+            if done_trunc and "final_observation" in infos:
+                last_new_state = infos["final_observation"][i]
+            else:
+                last_new_state = new_states[i]
+            exp = Experience(
+                state=self.states[i], action=int(actions[i]), reward=float(rewards[i]),
+                done_trunc=done_trunc, new_state=last_new_state
+            )
+            self.exp_buffer.append(exp)
+            if done_trunc:
+                done_rewards.append(float(self.total_rewards[i]))
+                self.total_rewards[i] = 0.0
+
+        self.states = new_states
+        return done_rewards
 
 
 def batch_to_tensors(batch: list[Experience], device: torch.device) -> BatchTensors:
@@ -149,14 +160,15 @@ if __name__ == "__main__":
     args = parser.parse_args()
     device = torch.device(args.dev)
 
-    env = wrappers.make_env(args.env)
-    assert isinstance(env.observation_space, gym.spaces.Box)
-    assert isinstance(env.action_space, gym.spaces.Discrete)
+    env = gym.vector.AsyncVectorEnv(
+        [wrappers.make_env_fn(args.env) for _ in range(N_ENVS)])
+    assert isinstance(env.single_observation_space, gym.spaces.Box)
+    assert isinstance(env.single_action_space, gym.spaces.Discrete)
     net = cast(dqn_model.DQN, torch.compile(
-        dqn_model.DQN(env.observation_space.shape, env.action_space.n).to(device),
+        dqn_model.DQN(env.single_observation_space.shape, env.single_action_space.n).to(device),
         backend="cudagraphs"))
     tgt_net = cast(dqn_model.DQN, torch.compile(
-        dqn_model.DQN(env.observation_space.shape, env.action_space.n).to(device),
+        dqn_model.DQN(env.single_observation_space.shape, env.single_action_space.n).to(device),
         backend="cudagraphs"))
     writer = SummaryWriter(comment="-" + args.env)
     print(net)
@@ -166,24 +178,28 @@ if __name__ == "__main__":
     epsilon = EPSILON_START
 
     optimizer = optim.Adam(net.parameters(), lr=LEARNING_RATE)
-    scaler = GradScaler()
+    scaler = GradScaler("cuda")
     total_rewards = []
     frame_idx = 0
     ts_frame = 0
     ts = time.time()
     start_ts = ts
     best_m_reward = None
+    last_sync = 0
+    solved = False
 
-    while True:
-        frame_idx += 1
+    while not solved:
+        frame_idx += N_ENVS
         epsilon = max(EPSILON_FINAL, EPSILON_START - frame_idx / EPSILON_DECAY_LAST_FRAME)
 
-        reward = agent.play_step(net, device, epsilon)
-        if reward is not None:
-            total_rewards.append(reward)
-            speed = (frame_idx - ts_frame) / (time.time() - ts)
+        rewards = agent.play_step(net, device, epsilon)
+        if rewards:
+            now = time.time()
+            speed = (frame_idx - ts_frame) / (now - ts)
             ts_frame = frame_idx
-            ts = time.time()
+            ts = now
+        for reward in rewards:
+            total_rewards.append(reward)
             m_reward = np.mean(total_rewards[-100:])
             elapsed = time.strftime("%H:%M:%S", time.gmtime(time.time() - start_ts))
             print(f"{elapsed} {frame_idx}: done {len(total_rewards)} games, "
@@ -193,17 +209,20 @@ if __name__ == "__main__":
             writer.add_scalar("reward_100", m_reward, frame_idx)
             writer.add_scalar("reward", reward, frame_idx)
             if best_m_reward is None or best_m_reward < m_reward:
-                torch.save(net.state_dict(), args.env + "-best_%.0f.dat" % m_reward)
+                torch.save(net._orig_mod.state_dict(), args.env + "-best_%.0f.dat" % m_reward)
                 if best_m_reward is not None:
                     print(f"Best reward updated {best_m_reward:.3f} -> {m_reward:.3f}")
                 best_m_reward = m_reward
             if m_reward > MEAN_REWARD_BOUND:
                 print("Solved in %d frames!" % frame_idx)
+                solved = True
                 break
+
         if len(buffer) < REPLAY_START_SIZE:
             continue
-        if frame_idx % SYNC_TARGET_FRAMES == 0:
+        if frame_idx - last_sync >= SYNC_TARGET_FRAMES:
             tgt_net.load_state_dict(net.state_dict())
+            last_sync = frame_idx
 
         optimizer.zero_grad()
         batch = buffer.sample(BATCH_SIZE)

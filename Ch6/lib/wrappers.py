@@ -53,3 +53,9 @@ def make_env(env_name: str, **kwargs):
     env = ImageToPyTorch(env)
     env = BufferWrapper(env, n_steps=4)
     return env
+
+
+def make_env_fn(env_name: str, **kwargs):
+    def _make():
+        return make_env(env_name, **kwargs)
+    return _make

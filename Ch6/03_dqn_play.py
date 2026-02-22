@@ -27,6 +27,7 @@ if __name__ == "__main__":
     assert isinstance(env.action_space, gym.spaces.Discrete)
     net = dqn_model.DQN(env.observation_space.shape, env.action_space.n)
     state = torch.load(args.model, map_location=lambda stg, _: stg, weights_only=True)
+    state = {k.removeprefix("_orig_mod."): v for k, v in state.items()}
     net.load_state_dict(state)
 
     state, _ = env.reset()
