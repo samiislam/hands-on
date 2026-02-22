@@ -11,6 +11,8 @@ import collections
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.cuda.amp import GradScaler
+from typing import cast
 
 from torch.utils.tensorboard.writer import SummaryWriter
 
@@ -19,7 +21,7 @@ DEFAULT_ENV_NAME = "PongNoFrameskip-v4"
 MEAN_REWARD_BOUND = 19
 
 GAMMA = 0.99
-BATCH_SIZE = 32
+BATCH_SIZE = 64
 REPLAY_SIZE = 100000
 LEARNING_RATE = 1e-4
 SYNC_TARGET_FRAMES = 1000
@@ -77,6 +79,7 @@ class Agent:
     @torch.no_grad()
     def play_step(self, net: dqn_model.DQN, device: torch.device,
                   epsilon: float = 0.0) -> float | None:
+        assert self.state is not None
         done_reward = None
 
         if np.random.random() < epsilon:
@@ -92,7 +95,6 @@ class Agent:
         new_state, reward, is_done, is_tr, _ = self.env.step(action)
         self.total_reward += float(reward)
 
-        assert self.state is not None
         exp = Experience(
             state=self.state, action=action, reward=float(reward),
             done_trunc=is_done or is_tr, new_state=new_state
@@ -118,24 +120,25 @@ def batch_to_tensors(batch: list[Experience], device: torch.device) -> BatchTens
     rewards_t = torch.FloatTensor(rewards)
     dones_t = torch.BoolTensor(dones)
     new_states_t = torch.as_tensor(np.asarray(new_state))
-    return states_t.to(device), actions_t.to(device), rewards_t.to(device), \
-           dones_t.to(device),  new_states_t.to(device)
+    return states_t.to(device, non_blocking=True), actions_t.to(device, non_blocking=True), \
+           rewards_t.to(device, non_blocking=True), dones_t.to(device, non_blocking=True), \
+           new_states_t.to(device, non_blocking=True)
 
 
 def calc_loss(batch: list[Experience], net: dqn_model.DQN, tgt_net: dqn_model.DQN,
               device: torch.device) -> torch.Tensor:
     states_t, actions_t, rewards_t, dones_t, new_states_t = batch_to_tensors(batch, device)
 
-    state_action_values = net(states_t).gather(
-        1, actions_t.unsqueeze(-1)
-    ).squeeze(-1)
-    with torch.no_grad():
-        next_state_values = tgt_net(new_states_t).max(1)[0]
-        next_state_values[dones_t] = 0.0
-        next_state_values = next_state_values.detach()
+    with torch.autocast(device_type=device.type):
+        state_action_values = net(states_t).gather(
+            1, actions_t.unsqueeze(-1)
+        ).squeeze(-1)
+        with torch.no_grad():
+            next_state_values = tgt_net(new_states_t).max(1)[0]
+            next_state_values[dones_t] = 0.0
 
-    expected_state_action_values = next_state_values * GAMMA + rewards_t
-    return nn.MSELoss()(state_action_values, expected_state_action_values)
+        expected_state_action_values = next_state_values * GAMMA + rewards_t
+        return nn.MSELoss()(state_action_values, expected_state_action_values)
 
 
 if __name__ == "__main__":
@@ -149,8 +152,12 @@ if __name__ == "__main__":
     env = wrappers.make_env(args.env)
     assert isinstance(env.observation_space, gym.spaces.Box)
     assert isinstance(env.action_space, gym.spaces.Discrete)
-    net = dqn_model.DQN(env.observation_space.shape, env.action_space.n).to(device)
-    tgt_net = dqn_model.DQN(env.observation_space.shape, env.action_space.n).to(device)
+    net = cast(dqn_model.DQN, torch.compile(
+        dqn_model.DQN(env.observation_space.shape, env.action_space.n).to(device),
+        backend="cudagraphs"))
+    tgt_net = cast(dqn_model.DQN, torch.compile(
+        dqn_model.DQN(env.observation_space.shape, env.action_space.n).to(device),
+        backend="cudagraphs"))
     writer = SummaryWriter(comment="-" + args.env)
     print(net)
 
@@ -159,10 +166,12 @@ if __name__ == "__main__":
     epsilon = EPSILON_START
 
     optimizer = optim.Adam(net.parameters(), lr=LEARNING_RATE)
+    scaler = GradScaler()
     total_rewards = []
     frame_idx = 0
     ts_frame = 0
     ts = time.time()
+    start_ts = ts
     best_m_reward = None
 
     while True:
@@ -176,8 +185,9 @@ if __name__ == "__main__":
             ts_frame = frame_idx
             ts = time.time()
             m_reward = np.mean(total_rewards[-100:])
-            print(f"{frame_idx}: done {len(total_rewards)} games, reward {m_reward:.3f}, "
-                  f"eps {epsilon:.2f}, speed {speed:.2f} f/s")
+            elapsed = time.strftime("%H:%M:%S", time.gmtime(time.time() - start_ts))
+            print(f"{elapsed} {frame_idx}: done {len(total_rewards)} games, "
+                  f"reward {m_reward:.3f}, eps {epsilon:.2f}, speed {speed:.2f} f/s")
             writer.add_scalar("epsilon", epsilon, frame_idx)
             writer.add_scalar("speed", speed, frame_idx)
             writer.add_scalar("reward_100", m_reward, frame_idx)
@@ -198,6 +208,7 @@ if __name__ == "__main__":
         optimizer.zero_grad()
         batch = buffer.sample(BATCH_SIZE)
         loss_t = calc_loss(batch, net, tgt_net, device)
-        loss_t.backward()
-        optimizer.step()
+        scaler.scale(loss_t).backward()
+        scaler.step(optimizer)
+        scaler.update()
     writer.close()
