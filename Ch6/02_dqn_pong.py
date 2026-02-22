@@ -11,7 +11,7 @@ import collections
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.amp import GradScaler
+from torch.amp.grad_scaler import GradScaler
 from typing import cast
 
 from torch.utils.tensorboard.writer import SummaryWriter
@@ -27,7 +27,7 @@ LEARNING_RATE = 1e-4
 SYNC_TARGET_FRAMES = 1000
 REPLAY_START_SIZE = 10000
 
-N_ENVS = 8  # try 16 if GPU is still the bottleneck
+N_ENVS = 8
 
 EPSILON_DECAY_LAST_FRAME = 150000 * N_ENVS
 EPSILON_START = 1.0
@@ -164,9 +164,8 @@ if __name__ == "__main__":
         [wrappers.make_env_fn(args.env) for _ in range(N_ENVS)])
     assert isinstance(env.single_observation_space, gym.spaces.Box)
     assert isinstance(env.single_action_space, gym.spaces.Discrete)
-    net = cast(dqn_model.DQN, torch.compile(
-        dqn_model.DQN(env.single_observation_space.shape, env.single_action_space.n).to(device),
-        backend="cudagraphs"))
+    raw_net = dqn_model.DQN(env.single_observation_space.shape, env.single_action_space.n).to(device)
+    net = cast(dqn_model.DQN, torch.compile(raw_net, backend="cudagraphs"))
     tgt_net = cast(dqn_model.DQN, torch.compile(
         dqn_model.DQN(env.single_observation_space.shape, env.single_action_space.n).to(device),
         backend="cudagraphs"))
@@ -187,6 +186,7 @@ if __name__ == "__main__":
     best_m_reward = None
     last_sync = 0
     solved = False
+    speed = 0.0
 
     while not solved:
         frame_idx += N_ENVS
@@ -195,7 +195,9 @@ if __name__ == "__main__":
         rewards = agent.play_step(net, device, epsilon)
         if rewards:
             now = time.time()
-            speed = (frame_idx - ts_frame) / (now - ts)
+            elapsed = now - ts
+            if elapsed > 0:
+                speed = (frame_idx - ts_frame) / elapsed
             ts_frame = frame_idx
             ts = now
         for reward in rewards:
@@ -209,7 +211,7 @@ if __name__ == "__main__":
             writer.add_scalar("reward_100", m_reward, frame_idx)
             writer.add_scalar("reward", reward, frame_idx)
             if best_m_reward is None or best_m_reward < m_reward:
-                torch.save(net._orig_mod.state_dict(), args.env + "-best_%.0f.dat" % m_reward)
+                torch.save(raw_net.state_dict(), args.env + "-best_%.0f.dat" % m_reward)
                 if best_m_reward is not None:
                     print(f"Best reward updated {best_m_reward:.3f} -> {m_reward:.3f}")
                 best_m_reward = m_reward
