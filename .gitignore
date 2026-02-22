@@ -15,3 +15,5 @@ wheels/
 
 runs/
 video/
+
+*.dat
