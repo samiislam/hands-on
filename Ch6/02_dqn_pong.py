@@ -179,11 +179,17 @@ def calc_loss(batch: list[Experience], net: dqn_model.DQN, tgt_net: dqn_model.DQ
     states_t, actions_t, rewards_t, dones_t, new_states_t = batch_to_tensors(batch, device)
 
     with torch.autocast(device_type=device.type):
-        state_action_values = net(states_t).gather(
+        # Single batched forward pass through net for both current and next states
+        all_states = torch.cat([states_t, new_states_t])
+        all_q = net(all_states)
+        q_current, q_next = all_q[:len(batch)], all_q[len(batch):]
+
+        state_action_values = q_current.gather(
             1, actions_t.unsqueeze(-1)
         ).squeeze(-1)
         with torch.no_grad():
-            next_state_values = tgt_net(new_states_t).max(1)[0]
+            best_actions = q_next.argmax(1, keepdim=True)
+            next_state_values = tgt_net(new_states_t).gather(1, best_actions).squeeze(-1)
             next_state_values[dones_t] = 0.0
 
         expected_state_action_values = next_state_values * (gamma ** n_steps) + rewards_t
