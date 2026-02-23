@@ -24,7 +24,7 @@ GAMMA = 0.99
 BATCH_SIZE = 64
 REPLAY_SIZE = 100000
 LEARNING_RATE = 1e-4
-SYNC_TARGET_FRAMES = 1000
+TAU = 0.005
 REPLAY_START_SIZE = 10000
 N_STEPS = 3
 
@@ -222,7 +222,6 @@ if __name__ == "__main__":
     ts = time.time()
     start_ts = ts
     best_m_reward = None
-    last_sync = 0
     solved = False
     speed = 0.0
 
@@ -260,9 +259,6 @@ if __name__ == "__main__":
 
         if len(buffer) < REPLAY_START_SIZE:
             continue
-        if frame_idx - last_sync >= SYNC_TARGET_FRAMES:
-            tgt_net.load_state_dict(net.state_dict())
-            last_sync = frame_idx
 
         optimizer.zero_grad()
         batch = buffer.sample(BATCH_SIZE)
@@ -270,4 +266,9 @@ if __name__ == "__main__":
         scaler.scale(loss_t).backward()
         scaler.step(optimizer)
         scaler.update()
+
+        # Polyak averaging: soft update target network
+        with torch.no_grad():
+            for p, p_tgt in zip(net.parameters(), tgt_net.parameters()):
+                p_tgt.data.mul_(1 - TAU).add_(TAU * p.data)
     writer.close()
