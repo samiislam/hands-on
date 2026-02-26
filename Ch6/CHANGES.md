@@ -1,65 +1,99 @@
-# DQN Pong - Changes Log
+# Differences from the Original `02_dqn_pong.py`
 
-## Files Modified
-- `Ch6/02_dqn_pong.py` — main training script
-- `Ch6/lib/dqn_model.py` — network architecture
+Original source: [PacktPublishing/Deep-Reinforcement-Learning-Hands-On-Third-Edition – Chapter06](https://github.com/PacktPublishing/Deep-Reinforcement-Learning-Hands-On-Third-Edition/blob/main/Chapter06/)
 
-## Changes Applied (current state)
+---
 
-### 1. N-Step Returns
-**What:** Instead of storing single-step transitions `(s, a, r, s')`, the agent accumulates `N_STEPS=3` transitions per environment and stores a folded experience with the discounted n-step reward: `r_0 + γr_1 + γ²r_2`.
+## `lib/dqn_model.py`
 
-**Why:** Propagates sparse rewards (Pong only gives +1/-1 when a point is scored) back to earlier states faster, without relying on the network having learned accurate intermediate value estimates.
+| Area | Original | Ours |
+|---|---|---|
+| `forward` type hint | `x: torch.ByteTensor` | `x: torch.Tensor` |
 
-**How:**
-- Each of the 8 parallel environments has its own `step_buffers[i]` deque (maxlen=N_STEPS)
-- `_flush_steps()` folds the buffer into a single experience: `(s_0, a_0, R_n, done, s_n)`
-- When a buffer is full, one n-step experience is emitted and the oldest step is dropped
-- When an episode ends early (< n steps), the partial buffer is flushed immediately
-- `calc_loss` bootstraps with `γ^n` instead of `γ`
+No other changes.
 
-### 2. Double DQN
-**What:** Decouples action selection from action evaluation in the target computation to reduce overestimation bias.
+---
 
-**Why:** Standard DQN uses `max` over the target network's Q-values, which is biased upward when Q-estimates are noisy. Double DQN uses the online network to select the best action and the target network to evaluate it.
+## `02_dqn_pong.py`
 
-**How:**
-- In `calc_loss`, both `states_t` and `new_states_t` are concatenated and passed through `net` in a single batched forward pass (optimization to avoid two separate passes)
-- The online network's Q-values for next states select the best action via `argmax`
-- The target network evaluates that action via `gather`
+### 1. Vectorized environments (`N_ENVS = 8`)
 
-### 3. Polyak Averaging (Soft Target Updates)
-**What:** Replaced hard target network sync (copy every N frames) with continuous exponential moving average updates using `TAU=0.005`.
+The original uses a single `gym.Env`. Ours uses `gym.vector.AsyncVectorEnv` with 8 parallel environments, collecting `N_ENVS` transitions per iteration.
 
-**Why:** Provides smoother, more stable target updates compared to periodic hard copies. The target network continuously tracks the online network instead of being stale for long periods then jumping.
+This required rewriting the `Agent` class:
 
-**How:**
-- After every training step: `θ_target = (1 - τ) * θ_target + τ * θ_online`
-- Removed `SYNC_TARGET_FRAMES` constant and `last_sync` variable
+- `play_step` processes all envs in one batched call and returns a **list** of completed-episode rewards instead of a single `Optional[float]`.
+- `states` is a 2-D array (one row per env) instead of a single observation.
+- Epsilon-greedy action selection runs a single batched forward pass and `torch.max` over the batch, rather than unsqueezing a single state.
+- Uses `VectorEnv` auto-reset handling: when an env is done, `final_observation` from `infos` is used as the true terminal observation (the regular `new_states[i]` is already the first obs of the next episode).
 
-### 4. Single Best Model Save
-**What:** The training loop saves a single `PongNoFrameskip-v4-best.dat` file, overwriting it each time a new best mean reward is achieved.
+### 2. N-step returns (`N_STEPS = 3`)
 
-**Why:** Previously created a separate file for every new best reward (e.g., `-best_-21.dat`, `-best_-20.dat`), leading to many files.
+The original stores 1-step transitions. Ours accumulates `n_steps` consecutive experiences per environment in a deque (`step_buffers`), then folds them into a single n-step transition with a discounted cumulative reward before appending to the replay buffer.
+
+- `_flush_steps` computes `r_0 + γ r_1 + γ² r_2 + ...` and stores `(s_0, a_0, R_n, done_n, s_n)`.
+- On episode termination the partial buffer (possibly < n steps) is flushed immediately.
+- `calc_loss` uses `gamma ** n_steps` instead of `gamma` when bootstrapping.
+
+### 3. Double DQN
+
+The original selects **and** evaluates the next action using `tgt_net`:
+
+```python
+next_state_values = tgt_net(new_states_t).max(1)[0]
+```
+
+Ours uses Double DQN — the online `net` selects the best next action, `tgt_net` evaluates it:
+
+```python
+best_actions = q_next.argmax(1, keepdim=True)                      # net selects
+next_state_values = tgt_net(new_states_t).gather(1, best_actions)   # tgt_net evaluates
+```
+
+Additionally, ours batches the current-state and next-state forward passes through `net` into a single `torch.cat` call to reduce kernel-launch overhead.
+
+### 4. Polyak averaging (soft target updates) instead of hard sync
+
+| | Original | Ours |
+|---|---|---|
+| Strategy | Hard copy every `SYNC_TARGET_FRAMES = 1000` steps | Soft update every step with `TAU = 0.005` |
+| Code | `tgt_net.load_state_dict(net.state_dict())` | `p_tgt.mul_(1 - TAU).add_(TAU * p.data)` |
+| Placement | Before the gradient step | After the gradient step (so the update incorporates the latest gradient) |
+
+### 5. Mixed-precision training
+
+Ours wraps the loss computation in `torch.autocast` and uses `GradScaler` for AMP. The original uses full fp32 throughout.
+
+### 6. `torch.compile` with cudagraphs backend
+
+Ours compiles both `net` and `tgt_net` with `torch.compile(backend="cudagraphs")` and inserts `torch.compiler.cudagraph_mark_step_begin()` before inference in `play_step`. The original runs eagerly.
+
+### 7. Hyperparameter changes
+
+| Parameter | Original | Ours |
+|---|---|---|
+| `BATCH_SIZE` | 32 | 64 |
+| `REPLAY_SIZE` | 10 000 | 100 000 |
+| Default device | `cpu` | `cuda` |
+| `EPSILON_DECAY_LAST_FRAME` | 150 000 | `150000 * N_ENVS * 0.75` (900 000) |
+
+### 8. Non-blocking tensor transfers
+
+`batch_to_tensors` uses `non_blocking=True` on `.to(device)` calls. The original does blocking transfers.
+
+### 9. Logging and model saving
+
+- Elapsed wall-clock time (`HH:MM:SS`) is printed alongside each episode completion.
+- Model is saved as `{env}-best.dat` (single file, overwritten) instead of `{env}-best_{reward}.dat` (one file per new best).
+
+### 10. Type hints modernized
+
+`tt.Optional`, `tt.List`, `tt.Tuple` replaced with native Python 3.10+ equivalents (`X | None`, `list[X]`, `tuple[X, ...]`).
+
+---
 
 ## Changes Tried and Reverted
 
-### Dueling DQN (reverted)
-**What:** Split the FC head into separate value V(s) and advantage A(s,a) streams, combined as `Q(s,a) = V(s) + A(s,a) - mean(A)`.
+### Dueling DQN
 
-**Why reverted:** Added a small but measurable per-step overhead (extra linear layers + mean computation). For Pong's small action space (6 actions), the learning efficiency gain was not worth the speed cost. Dueling DQN is more beneficial in environments with many actions.
-
-## Current Hyperparameters
-| Parameter | Value | Notes |
-|---|---|---|
-| GAMMA | 0.99 | Discount factor |
-| BATCH_SIZE | 64 | |
-| REPLAY_SIZE | 100,000 | |
-| LEARNING_RATE | 1e-4 | Adam optimizer |
-| TAU | 0.005 | Polyak averaging rate |
-| REPLAY_START_SIZE | 10,000 | Fill buffer before training |
-| N_STEPS | 3 | N-step returns |
-| N_ENVS | 8 | Parallel environments |
-| EPSILON_START | 1.0 | |
-| EPSILON_FINAL | 0.01 | |
-| EPSILON_DECAY_LAST_FRAME | 150000 * N_ENVS * 0.75 | |
+Split the FC head into separate value V(s) and advantage A(s,a) streams, combined as `Q(s,a) = V(s) + A(s,a) - mean(A)`. **Reverted** because the added per-step overhead (extra linear layers + mean computation) wasn't worth it for Pong's small action space (6 actions). Dueling DQN is more beneficial in environments with many actions.
