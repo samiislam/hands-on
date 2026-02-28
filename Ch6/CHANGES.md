@@ -1,4 +1,4 @@
-# Differences from the Original `02_dqn_pong.py`
+# Differences from the Original Chapter 06
 
 Original source: [PacktPublishing/Deep-Reinforcement-Learning-Hands-On-Third-Edition – Chapter06](https://github.com/PacktPublishing/Deep-Reinforcement-Learning-Hands-On-Third-Edition/blob/main/Chapter06/)
 
@@ -34,6 +34,8 @@ The original stores 1-step transitions. Ours accumulates `n_steps` consecutive e
 - `_flush_steps` computes `r_0 + γ r_1 + γ² r_2 + ...` and stores `(s_0, a_0, R_n, done_n, s_n)`.
 - On episode termination the partial buffer (possibly < n steps) is flushed immediately.
 - `calc_loss` uses `gamma ** n_steps` instead of `gamma` when bootstrapping.
+
+> **Off-policy bias.** N-step DQN is off-policy: transitions sit in a replay buffer and the bootstrap target uses a greedy max-Q. The n-step return, however, sums intermediate rewards that were collected under the *behavior* policy (epsilon-greedy), not the current greedy policy. This mismatch introduces off-policy bias that grows with `n`. Our implementation (like Rainbow) leaves this uncorrected — it works well in practice. The rigorous fix would be to weight each transition by importance-sampling ratios `π(aₜ)/μ(aₜ)`, but these ratios add significant variance and are usually not worth the cost for small `n`.
 
 ### 3. Double DQN
 
@@ -97,3 +99,29 @@ Ours compiles both `net` and `tgt_net` with `torch.compile(backend="cudagraphs")
 ### Dueling DQN
 
 Split the FC head into separate value V(s) and advantage A(s,a) streams, combined as `Q(s,a) = V(s) + A(s,a) - mean(A)`. **Reverted** because the added per-step overhead (extra linear layers + mean computation) wasn't worth it for Pong's small action space (6 actions). Dueling DQN is more beneficial in environments with many actions.
+
+---
+
+## `03_dqn_play.py`
+
+### 1. `torch.compile` key-stripping on model load
+
+Because the training script saves `raw_net` (the unwrapped module inside `torch.compile`), but `torch.compile` may still prefix keys with `_orig_mod.`, ours strips that prefix before loading:
+
+```python
+state = {k.removeprefix("_orig_mod."): v for k, v in state.items()}
+```
+
+The original loads the state dict directly without any key transformation.
+
+### 2. Space-type assertions
+
+Ours adds explicit `assert isinstance(...)` checks for `observation_space` (Box) and `action_space` (Discrete) before passing `.shape` / `.n` to the model constructor. The original accesses these attributes without assertions.
+
+### 3. Type hint for action counter
+
+The original uses `tt.Dict[int, int]` (from `typing`). Ours uses `collections.Counter[int]` directly and drops the `typing` import entirely.
+
+### 4. Reward accumulation cast
+
+Ours wraps `reward` in `float()` (`total_reward += float(reward)`) to handle the case where the env returns a numpy scalar. The original uses `total_reward += reward` directly.
