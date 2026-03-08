@@ -49,10 +49,12 @@ def calc_loss_double_dqn(
     state_action_vals = state_action_vals.squeeze(-1)
     with torch.no_grad():
         next_states_v = torch.as_tensor(next_states).to(device)
+        # Double DQN: online net selects the best action: a* = argmax_a Q(s', a)
         next_state_acts = net(next_states_v).max(1)[1]
-        next_state_acts = next_state_acts.unsqueeze(-1)
+        next_state_acts = next_state_acts.unsqueeze(-1)  # reshape for gather: [batch] -> [batch, 1]
+        # Target net evaluates that action: Q_tgt(s', a*) — decouples selection from evaluation
         next_state_vals = tgt_net(next_states_v).gather(1, next_state_acts).squeeze(-1)
-        next_state_vals[done_mask] = 0.0
+        next_state_vals[done_mask] = 0.0  # terminal states have no future reward
         exp_sa_vals = next_state_vals.detach() * gamma + rewards_v
     return nn.MSELoss()(state_action_vals, exp_sa_vals)
 

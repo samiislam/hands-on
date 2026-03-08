@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
+import ale_py
 import gymnasium as gym
+gym.register_envs(ale_py)
 import ptan
 from typing import Any
 

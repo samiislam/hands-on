@@ -77,6 +77,7 @@ class Agent:
         self.gamma = gamma
         self.states: np.ndarray | None = None
         self.total_rewards = np.zeros(N_ENVS)
+        self.total_steps = np.zeros(N_ENVS, dtype=int)
         # per-environment deque to accumulate n-step transitions
         self.step_buffers: list[collections.deque[Experience]] = [
             collections.deque(maxlen=n_steps) for _ in range(N_ENVS)
@@ -86,6 +87,7 @@ class Agent:
     def _reset(self):
         self.states, _ = self.env.reset()
         self.total_rewards = np.zeros(N_ENVS)
+        self.total_steps = np.zeros(N_ENVS, dtype=int)
         for buf in self.step_buffers:
             buf.clear()
 
@@ -109,9 +111,9 @@ class Agent:
 
     @torch.no_grad()
     def play_step(self, net: dqn_model.DQN, device: torch.device,
-                  epsilon: float = 0.0) -> list[float]:
+                  epsilon: float = 0.0) -> list[tuple[float, int]]:
         assert self.states is not None
-        done_rewards: list[float] = []
+        done_episodes: list[tuple[float, int]] = []
 
         if np.random.random() < epsilon:
             actions = self.env.action_space.sample()
@@ -124,6 +126,7 @@ class Agent:
 
         new_states, rewards, is_done, is_tr, infos = self.env.step(actions)
         self.total_rewards += rewards
+        self.total_steps += 1
 
         for i in range(N_ENVS):
             done_trunc = bool(is_done[i]) or bool(is_tr[i])
@@ -143,8 +146,9 @@ class Agent:
                 # episode ended: flush whatever steps we have (possibly < n)
                 self._flush_steps(self.step_buffers[i])
                 self.step_buffers[i].clear()
-                done_rewards.append(float(self.total_rewards[i]))
+                done_episodes.append((float(self.total_rewards[i]), int(self.total_steps[i])))
                 self.total_rewards[i] = 0.0
+                self.total_steps[i] = 0
             elif len(self.step_buffers[i]) == self.n_steps:
                 # buffer full: emit one n-step experience
                 self._flush_steps(self.step_buffers[i])
@@ -152,7 +156,7 @@ class Agent:
                 self.step_buffers[i].popleft()
 
         self.states = new_states
-        return done_rewards
+        return done_episodes
 
 
 def batch_to_tensors(batch: list[Experience], device: torch.device) -> BatchTensors:
@@ -235,15 +239,15 @@ if __name__ == "__main__":
         frame_idx += N_ENVS
         epsilon = max(EPSILON_FINAL, EPSILON_START - frame_idx / EPSILON_DECAY_LAST_FRAME)
 
-        rewards = agent.play_step(net, device, epsilon)
-        if rewards:
+        episodes = agent.play_step(net, device, epsilon)
+        if episodes:
             now = time.time()
             elapsed = now - ts
             if elapsed > 0:
                 speed = (frame_idx - ts_frame) / elapsed
             ts_frame = frame_idx
             ts = now
-        for reward in rewards:
+        for reward, steps in episodes:
             total_rewards.append(reward)
             m_reward = np.mean(total_rewards[-100:])
             elapsed = time.strftime("%H:%M:%S", time.gmtime(time.time() - start_ts))
@@ -253,6 +257,7 @@ if __name__ == "__main__":
             writer.add_scalar("speed", speed, frame_idx)
             writer.add_scalar("reward_100", m_reward, frame_idx)
             writer.add_scalar("reward", reward, frame_idx)
+            writer.add_scalar("steps", steps, frame_idx)
             if best_m_reward is None or best_m_reward < m_reward:
                 torch.save(raw_net.state_dict(), args.env + "-best.dat")
                 if best_m_reward is not None:

@@ -16,7 +16,7 @@ torchvision==0.24.1
 numpy>=2.0,<3
 
 # --- RL Environments ---
-gymnasium[atari,classic-control]==1.2.3
+gymnasium[atari,classic-control,accept-rom-license]==1.2.3
 
 # --- RL Libraries ---
 stable-baselines3==2.7.1
