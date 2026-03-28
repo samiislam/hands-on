@@ -28,6 +28,7 @@ REPLAY_SIZE = 100000
 LEARNING_RATE = 1e-4
 TAU = 0.005
 REPLAY_START_SIZE = 10000
+N_STEPS = 3
 
 N_ENVS = 8
 
@@ -71,19 +72,44 @@ class ExperienceBuffer:
 
 class Agent:
     def __init__(self, env: gym.vector.VectorEnv, exp_buffer: ExperienceBuffer,
-                 gamma: float = GAMMA):
+                 n_steps: int = N_STEPS, gamma: float = GAMMA):
         self.env = env
         self.exp_buffer = exp_buffer
+        self.n_steps = n_steps
         self.gamma = gamma
         self.states: np.ndarray | None = None
         self.total_rewards = np.zeros(N_ENVS)
         self.total_steps = np.zeros(N_ENVS, dtype=int)
+        # per-environment deque to accumulate n-step transitions
+        self.step_buffers: list[collections.deque[Experience]] = [
+            collections.deque(maxlen=n_steps) for _ in range(N_ENVS)
+        ]
         self._reset()
 
     def _reset(self):
         self.states, _ = self.env.reset()
         self.total_rewards = np.zeros(N_ENVS)
         self.total_steps = np.zeros(N_ENVS, dtype=int)
+        for buf in self.step_buffers:
+            buf.clear()
+
+    def _flush_steps(self, buf: collections.deque[Experience]):
+        """Fold the step buffer into a single n-step experience and store it."""
+        if not buf:
+            return
+        # discounted n-step reward: r_0 + γ r_1 + γ² r_2 + ...
+        reward = 0.0
+        for exp in reversed(buf):
+            reward = exp.reward + self.gamma * reward
+        first = buf[0]
+        last = buf[-1]
+        self.exp_buffer.append(Experience(
+            state=first.state,
+            action=first.action,
+            reward=reward,
+            done_trunc=last.done_trunc,
+            new_state=last.new_state,
+        ))
 
     @torch.no_grad()
     def play_step(self, net: dqn_model.DQN, device: torch.device,
@@ -106,6 +132,8 @@ class Agent:
 
         for i in range(N_ENVS):
             done_trunc = bool(is_done[i]) or bool(is_tr[i])
+            # VectorEnv autoreset: new_states[i] is the first obs of the next
+            # episode when done. The true final obs is stored in infos.
             if done_trunc and "final_observation" in infos:
                 last_new_state = infos["final_observation"][i]
             else:
@@ -114,12 +142,20 @@ class Agent:
                 state=self.states[i], action=int(actions[i]), reward=float(rewards[i]),
                 done_trunc=done_trunc, new_state=last_new_state
             )
-            self.exp_buffer.append(exp)
+            self.step_buffers[i].append(exp)
 
             if done_trunc:
+                # episode ended: flush whatever steps we have (possibly < n)
+                self._flush_steps(self.step_buffers[i])
+                self.step_buffers[i].clear()
                 done_episodes.append((float(self.total_rewards[i]), int(self.total_steps[i])))
                 self.total_rewards[i] = 0.0
                 self.total_steps[i] = 0
+            elif len(self.step_buffers[i]) == self.n_steps:
+                # buffer full: emit one n-step experience
+                self._flush_steps(self.step_buffers[i])
+                # drop the oldest step so next iteration can append
+                self.step_buffers[i].popleft()
 
         self.states = new_states
         return done_episodes
@@ -144,19 +180,25 @@ def batch_to_tensors(batch: list[Experience], device: torch.device) -> BatchTens
 
 
 def calc_loss(batch: list[Experience], net: dqn_model.DQN, tgt_net: dqn_model.DQN,
-              device: torch.device, gamma: float = GAMMA) -> torch.Tensor:
+              device: torch.device, n_steps: int = N_STEPS,
+              gamma: float = GAMMA) -> torch.Tensor:
     states_t, actions_t, rewards_t, dones_t, new_states_t = batch_to_tensors(batch, device)
 
     with torch.autocast(device_type=device.type):
-        state_action_values = net(states_t).gather(
+        # Single batched forward pass through net for both current and next states
+        all_states = torch.cat([states_t, new_states_t])
+        all_q = net(all_states)
+        q_current, q_next = all_q[:len(batch)], all_q[len(batch):]
+
+        state_action_values = q_current.gather(
             1, actions_t.unsqueeze(-1)
         ).squeeze(-1)
         with torch.no_grad():
-            # Standard DQN: target net selects AND evaluates best action
-            next_state_values = tgt_net(new_states_t).max(1)[0]
+            best_actions = q_next.argmax(1, keepdim=True)
+            next_state_values = tgt_net(new_states_t).gather(1, best_actions).squeeze(-1)
             next_state_values[dones_t] = 0.0
 
-        expected_state_action_values = next_state_values * gamma + rewards_t
+        expected_state_action_values = next_state_values * (gamma ** n_steps) + rewards_t
         return nn.MSELoss()(state_action_values, expected_state_action_values)
 
 
@@ -183,7 +225,7 @@ if __name__ == "__main__":
     tgt_net = cast(dqn_model.DQN, torch.compile(
         dqn_model.DQN(env.single_observation_space.shape, env.single_action_space.n).to(device),
         backend="cudagraphs"))
-    writer = SummaryWriter(comment="-" + args.env + "-vanilla")
+    writer = SummaryWriter(comment="-" + args.env)
     print(net)
 
     buffer = ExperienceBuffer(REPLAY_SIZE)
@@ -225,7 +267,7 @@ if __name__ == "__main__":
             writer.add_scalar("reward", reward, frame_idx)
             writer.add_scalar("steps", steps, frame_idx)
             if best_m_reward is None or best_m_reward < m_reward:
-                torch.save(raw_net.state_dict(), args.env + "-vanilla-best.dat")
+                torch.save(raw_net.state_dict(), args.env + "-best.dat")
                 if best_m_reward is not None:
                     print(f"Best reward updated {best_m_reward:.3f} -> {m_reward:.3f}")
                 best_m_reward = m_reward

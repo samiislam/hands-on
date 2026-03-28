@@ -29,6 +29,8 @@ This required rewriting the `Agent` class:
 
 ### 2. N-step returns (`N_STEPS = 3`)
 
+Multi-step returns propagate reward signal faster — instead of bootstrapping one step at a time, reward information reaches earlier states in fewer updates. Of the Rainbow components we use, this typically has the largest single impact on learning speed.
+
 The original stores 1-step transitions. Ours accumulates `n_steps` consecutive experiences per environment in a deque (`step_buffers`), then folds them into a single n-step transition with a discounted cumulative reward before appending to the replay buffer.
 
 - `_flush_steps` computes `r_0 + γ r_1 + γ² r_2 + ...` and stores `(s_0, a_0, R_n, done_n, s_n)`.
@@ -40,6 +42,8 @@ The original stores 1-step transitions. Ours accumulates `n_steps` consecutive e
 > Our implementation (like Rainbow) leaves this uncorrected. It works in practice for Pong because the game is simple enough that policies don't diverge dramatically over training — most states have an obvious best action (move toward the ball), and epsilon-greedy already injects random actions, so a "wrong" action from a stale policy looks much like an epsilon-random one. In harder environments with more nuanced strategies, the staleness of replay samples becomes a real problem, motivating shorter `n`, smaller replay buffers, or proper importance-sampling corrections (weighting each transition by `π(aₜ)/μ(aₜ)`), which add significant variance of their own.
 
 ### 3. Double DQN
+
+Double DQN reduces Q-value overestimation by decoupling action selection from action evaluation. Standard DQN uses the target net for both, which systematically overestimates Q-values because `max` over noisy estimates is biased upward. This leads to more stable and faster convergence.
 
 The original selects **and** evaluates the next action using `tgt_net`:
 

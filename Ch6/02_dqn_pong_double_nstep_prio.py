@@ -28,12 +28,18 @@ REPLAY_SIZE = 100000
 LEARNING_RATE = 1e-4
 TAU = 0.005
 REPLAY_START_SIZE = 10000
+N_STEPS = 3
 
 N_ENVS = 8
 
 EPSILON_DECAY_LAST_FRAME = 150000 * N_ENVS * 0.75
 EPSILON_START = 1.0
 EPSILON_FINAL = 0.01
+
+# Prioritized replay
+ALPHA = 0.6
+BETA_START = 0.4
+BETA_FRAMES = 1_000_000
 
 State = np.ndarray
 Action = int
@@ -54,36 +60,139 @@ class Experience:
     new_state: State
 
 
-class ExperienceBuffer:
+# ── SumTree ──────────────────────────────────────────────────────────────────
+class SumTree:
+    """Binary tree for O(log N) prioritized sampling."""
     def __init__(self, capacity: int):
-        self.buffer = collections.deque(maxlen=capacity)
+        self.capacity = capacity
+        self.tree = np.zeros(2 * capacity - 1, dtype=np.float64)
+        self.data = [None] * capacity
+        self.write = 0
+        self.size = 0
+
+    def _propagate(self, idx: int, change: float):
+        parent = (idx - 1) // 2
+        self.tree[parent] += change
+        if parent != 0:
+            self._propagate(parent, change)
+
+    def _retrieve(self, idx: int, s: float) -> int:
+        left = 2 * idx + 1
+        if left >= len(self.tree):
+            return idx
+        if s <= self.tree[left]:
+            return self._retrieve(left, s)
+        return self._retrieve(left + 1, s - self.tree[left])
+
+    def total(self) -> float:
+        return float(self.tree[0])
+
+    def add(self, priority: float, data):
+        idx = self.write + self.capacity - 1
+        self.data[self.write] = data
+        self.update(idx, priority)
+        self.write = (self.write + 1) % self.capacity
+        self.size = min(self.size + 1, self.capacity)
+
+    def update(self, idx: int, priority: float):
+        change = priority - self.tree[idx]
+        self.tree[idx] = priority
+        self._propagate(idx, change)
+
+    def get(self, s: float):
+        idx = self._retrieve(0, s)
+        data_idx = idx - self.capacity + 1
+        return idx, self.tree[idx], self.data[data_idx]
+
+
+# ── Prioritized Replay Buffer ───────────────────────────────────────────────
+class PrioritizedReplayBuffer:
+    def __init__(self, capacity: int, alpha: float = ALPHA):
+        self.tree = SumTree(capacity)
+        self.alpha = alpha
+        self.max_priority = 1.0
 
     def __len__(self):
-        return len(self.buffer)
+        return self.tree.size
 
     def append(self, experience: Experience):
-        self.buffer.append(experience)
+        self.tree.add(self.max_priority ** self.alpha, experience)
 
-    def sample(self, batch_size: int) -> list[Experience]:
-        indices = np.random.choice(len(self), batch_size, replace=False)
-        return [self.buffer[idx] for idx in indices]
+    def sample(self, batch_size: int, beta: float
+               ) -> tuple[list[Experience], np.ndarray, np.ndarray]:
+        """Returns (experiences, tree_indices, IS_weights)."""
+        experiences = []
+        indices = np.empty(batch_size, dtype=np.int64)
+        priorities = np.empty(batch_size, dtype=np.float64)
+
+        total = self.tree.total()
+        segment = total / batch_size
+
+        for i in range(batch_size):
+            lo = segment * i
+            hi = segment * (i + 1)
+            s = np.random.uniform(lo, hi)
+            idx, prio, data = self.tree.get(s)
+            if data is None:
+                s = np.random.uniform(0, total)
+                idx, prio, data = self.tree.get(s)
+            indices[i] = idx
+            priorities[i] = prio
+            experiences.append(data)
+
+        # Importance-sampling weights
+        probs = priorities / total
+        weights = (self.tree.size * probs) ** (-beta)
+        weights /= weights.max()
+        return experiences, indices, weights.astype(np.float32)
+
+    def update_priorities(self, indices: np.ndarray, td_errors: np.ndarray):
+        priorities = (np.abs(td_errors) + 1e-6) ** self.alpha
+        for idx, prio in zip(indices, priorities):
+            self.tree.update(int(idx), float(prio))
+        self.max_priority = max(self.max_priority, float(priorities.max()))
 
 
 class Agent:
-    def __init__(self, env: gym.vector.VectorEnv, exp_buffer: ExperienceBuffer,
-                 gamma: float = GAMMA):
+    def __init__(self, env: gym.vector.VectorEnv, exp_buffer: PrioritizedReplayBuffer,
+                 n_steps: int = N_STEPS, gamma: float = GAMMA):
         self.env = env
         self.exp_buffer = exp_buffer
+        self.n_steps = n_steps
         self.gamma = gamma
         self.states: np.ndarray | None = None
         self.total_rewards = np.zeros(N_ENVS)
         self.total_steps = np.zeros(N_ENVS, dtype=int)
+        # per-environment deque to accumulate n-step transitions
+        self.step_buffers: list[collections.deque[Experience]] = [
+            collections.deque(maxlen=n_steps) for _ in range(N_ENVS)
+        ]
         self._reset()
 
     def _reset(self):
         self.states, _ = self.env.reset()
         self.total_rewards = np.zeros(N_ENVS)
         self.total_steps = np.zeros(N_ENVS, dtype=int)
+        for buf in self.step_buffers:
+            buf.clear()
+
+    def _flush_steps(self, buf: collections.deque[Experience]):
+        """Fold the step buffer into a single n-step experience and store it."""
+        if not buf:
+            return
+        # discounted n-step reward: r_0 + γ r_1 + γ² r_2 + ...
+        reward = 0.0
+        for exp in reversed(buf):
+            reward = exp.reward + self.gamma * reward
+        first = buf[0]
+        last = buf[-1]
+        self.exp_buffer.append(Experience(
+            state=first.state,
+            action=first.action,
+            reward=reward,
+            done_trunc=last.done_trunc,
+            new_state=last.new_state,
+        ))
 
     @torch.no_grad()
     def play_step(self, net: dqn_model.DQN, device: torch.device,
@@ -106,6 +215,8 @@ class Agent:
 
         for i in range(N_ENVS):
             done_trunc = bool(is_done[i]) or bool(is_tr[i])
+            # VectorEnv autoreset: new_states[i] is the first obs of the next
+            # episode when done. The true final obs is stored in infos.
             if done_trunc and "final_observation" in infos:
                 last_new_state = infos["final_observation"][i]
             else:
@@ -114,12 +225,20 @@ class Agent:
                 state=self.states[i], action=int(actions[i]), reward=float(rewards[i]),
                 done_trunc=done_trunc, new_state=last_new_state
             )
-            self.exp_buffer.append(exp)
+            self.step_buffers[i].append(exp)
 
             if done_trunc:
+                # episode ended: flush whatever steps we have (possibly < n)
+                self._flush_steps(self.step_buffers[i])
+                self.step_buffers[i].clear()
                 done_episodes.append((float(self.total_rewards[i]), int(self.total_steps[i])))
                 self.total_rewards[i] = 0.0
                 self.total_steps[i] = 0
+            elif len(self.step_buffers[i]) == self.n_steps:
+                # buffer full: emit one n-step experience
+                self._flush_steps(self.step_buffers[i])
+                # drop the oldest step so next iteration can append
+                self.step_buffers[i].popleft()
 
         self.states = new_states
         return done_episodes
@@ -144,20 +263,36 @@ def batch_to_tensors(batch: list[Experience], device: torch.device) -> BatchTens
 
 
 def calc_loss(batch: list[Experience], net: dqn_model.DQN, tgt_net: dqn_model.DQN,
-              device: torch.device, gamma: float = GAMMA) -> torch.Tensor:
+              device: torch.device, is_weights: np.ndarray,
+              n_steps: int = N_STEPS,
+              gamma: float = GAMMA) -> tuple[torch.Tensor, np.ndarray]:
     states_t, actions_t, rewards_t, dones_t, new_states_t = batch_to_tensors(batch, device)
 
     with torch.autocast(device_type=device.type):
-        state_action_values = net(states_t).gather(
+        # Single batched forward pass through net for both current and next states
+        all_states = torch.cat([states_t, new_states_t])
+        all_q = net(all_states)
+        q_current, q_next = all_q[:len(batch)], all_q[len(batch):]
+
+        state_action_values = q_current.gather(
             1, actions_t.unsqueeze(-1)
         ).squeeze(-1)
         with torch.no_grad():
-            # Standard DQN: target net selects AND evaluates best action
-            next_state_values = tgt_net(new_states_t).max(1)[0]
+            best_actions = q_next.argmax(1, keepdim=True)
+            next_state_values = tgt_net(new_states_t).gather(1, best_actions).squeeze(-1)
             next_state_values[dones_t] = 0.0
 
-        expected_state_action_values = next_state_values * gamma + rewards_t
-        return nn.MSELoss()(state_action_values, expected_state_action_values)
+        expected_state_action_values = next_state_values * (gamma ** n_steps) + rewards_t
+
+        # Per-sample TD errors for priority updates
+        td_errors = (state_action_values - expected_state_action_values).detach().cpu().numpy()
+
+        # Importance-sampling weighted loss
+        weights_t = torch.as_tensor(is_weights, device=device)
+        per_sample_loss = (state_action_values - expected_state_action_values) ** 2
+        loss = (per_sample_loss * weights_t).mean()
+
+    return loss, td_errors
 
 
 if __name__ == "__main__":
@@ -183,10 +318,10 @@ if __name__ == "__main__":
     tgt_net = cast(dqn_model.DQN, torch.compile(
         dqn_model.DQN(env.single_observation_space.shape, env.single_action_space.n).to(device),
         backend="cudagraphs"))
-    writer = SummaryWriter(comment="-" + args.env + "-vanilla")
+    writer = SummaryWriter(comment="-" + args.env + "-per")
     print(net)
 
-    buffer = ExperienceBuffer(REPLAY_SIZE)
+    buffer = PrioritizedReplayBuffer(REPLAY_SIZE)
     agent = Agent(env, buffer)
     epsilon = EPSILON_START
 
@@ -204,6 +339,7 @@ if __name__ == "__main__":
     while not solved:
         frame_idx += N_ENVS
         epsilon = max(EPSILON_FINAL, EPSILON_START - frame_idx / EPSILON_DECAY_LAST_FRAME)
+        beta = min(1.0, BETA_START + frame_idx * (1.0 - BETA_START) / BETA_FRAMES)
 
         episodes = agent.play_step(net, device, epsilon)
         if episodes:
@@ -220,12 +356,13 @@ if __name__ == "__main__":
             print(f"{elapsed} {frame_idx}: done {len(total_rewards)} games, "
                   f"reward {m_reward:.3f}, eps {epsilon:.2f}, speed {speed:.2f} f/s")
             writer.add_scalar("epsilon", epsilon, frame_idx)
+            writer.add_scalar("beta", beta, frame_idx)
             writer.add_scalar("speed", speed, frame_idx)
             writer.add_scalar("reward_100", m_reward, frame_idx)
             writer.add_scalar("reward", reward, frame_idx)
             writer.add_scalar("steps", steps, frame_idx)
             if best_m_reward is None or best_m_reward < m_reward:
-                torch.save(raw_net.state_dict(), args.env + "-vanilla-best.dat")
+                torch.save(raw_net.state_dict(), args.env + "-per-best.dat")
                 if best_m_reward is not None:
                     print(f"Best reward updated {best_m_reward:.3f} -> {m_reward:.3f}")
                 best_m_reward = m_reward
@@ -238,11 +375,14 @@ if __name__ == "__main__":
             continue
 
         optimizer.zero_grad()
-        batch = buffer.sample(BATCH_SIZE)
-        loss_t = calc_loss(batch, net, tgt_net, device)
+        batch, tree_indices, is_weights = buffer.sample(BATCH_SIZE, beta)
+        loss_t, td_errors = calc_loss(batch, net, tgt_net, device, is_weights)
         scaler.scale(loss_t).backward()
         scaler.step(optimizer)
         scaler.update()
+
+        buffer.update_priorities(tree_indices, td_errors)
+        writer.add_scalar("loss", loss_t.item(), frame_idx)
 
         # Polyak averaging: soft update target network
         with torch.no_grad():
