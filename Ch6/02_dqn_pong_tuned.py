@@ -17,8 +17,6 @@ from typing import cast
 from torch.utils.tensorboard.writer import SummaryWriter
 
 
-SEED = 42
-
 DEFAULT_ENV_NAME = "PongNoFrameskip-v4"
 MEAN_REWARD_BOUND = 19
 
@@ -209,12 +207,6 @@ if __name__ == "__main__":
                         help="Name of the environment, default=" + DEFAULT_ENV_NAME)
     args = parser.parse_args()
     device = torch.device(args.dev)
-
-    import random
-    random.seed(SEED)
-    np.random.seed(SEED)
-    torch.manual_seed(SEED)
-    torch.cuda.manual_seed(SEED)
 
     env = gym.vector.AsyncVectorEnv(
         [wrappers.make_env_fn(args.env) for _ in range(N_ENVS)])
