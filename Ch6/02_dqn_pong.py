@@ -1,39 +1,42 @@
 #!/usr/bin/env python3
-import gymnasium as gym
-from lib import dqn_model
-from lib import wrappers
+"""Deep Q-Network (DQN) on Pong.
 
-from dataclasses import dataclass
+Off-policy algorithm that learns a Q-value function from a replay buffer
+of past transitions.  Uses a target network (Polyak-averaged) for stable
+bootstrap targets and epsilon-greedy exploration.
+"""
 import argparse
-import time
-import numpy as np
 import collections
+import time
+from dataclasses import dataclass
+from typing import cast
+
+import gymnasium as gym
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.amp.grad_scaler import GradScaler
-from typing import cast
-
 from torch.utils.tensorboard.writer import SummaryWriter
 
+from lib import dqn_model
+from lib import wrappers
 
-SEED = 42
 
-DEFAULT_ENV_NAME = "PongNoFrameskip-v4"
-MEAN_REWARD_BOUND = 19
-
-GAMMA = 0.99
 BATCH_SIZE = 64
-REPLAY_SIZE = 100000
+DEFAULT_ENV_NAME = "PongNoFrameskip-v4"
+GAMMA = 0.99
 LEARNING_RATE = 1e-4
-TAU = 0.005
-REPLAY_START_SIZE = 10000
-
+MEAN_REWARD_BOUND = 19
 N_ENVS = 8
+REPLAY_SIZE = 100000
+REPLAY_START_SIZE = 10000   # fill buffer before training starts
+SEED = 42
+TAU = 0.005                 # Polyak averaging coefficient for target net
 
 EPSILON_DECAY_LAST_FRAME = 150000 * N_ENVS * 0.75
-EPSILON_START = 1.0
 EPSILON_FINAL = 0.01
+EPSILON_START = 1.0
 
 State = np.ndarray
 Action = int
@@ -45,8 +48,10 @@ BatchTensors = tuple[
     torch.Tensor                # next state
 ]
 
+
 @dataclass
 class Experience:
+    """A single one-step transition (s, a, r, done, s')."""
     state: State
     action: Action
     reward: float
@@ -55,6 +60,8 @@ class Experience:
 
 
 class ExperienceBuffer:
+    """Fixed-capacity replay buffer with uniform random sampling."""
+
     def __init__(self, capacity: int):
         self.buffer = collections.deque(maxlen=capacity)
 
@@ -70,6 +77,8 @@ class ExperienceBuffer:
 
 
 class Agent:
+    """Interacts with vectorized environments using epsilon-greedy policy."""
+
     def __init__(self, env: gym.vector.VectorEnv, exp_buffer: ExperienceBuffer,
                  gamma: float = GAMMA):
         self.env = env
@@ -88,9 +97,11 @@ class Agent:
     @torch.no_grad()
     def play_step(self, net: dqn_model.DQN, device: torch.device,
                   epsilon: float = 0.0) -> list[tuple[float, int]]:
+        """Advance all envs by one step; return (reward, steps) for any finished episodes."""
         assert self.states is not None
         done_episodes: list[tuple[float, int]] = []
 
+        # epsilon-greedy action selection
         if np.random.random() < epsilon:
             actions = self.env.action_space.sample()
         else:
@@ -106,6 +117,8 @@ class Agent:
 
         for i in range(N_ENVS):
             done_trunc = bool(is_done[i]) or bool(is_tr[i])
+            # on termination the auto-reset overwrites new_states[i],
+            # so use final_observation to get the true last state
             if done_trunc and "final_observation" in infos:
                 last_new_state = infos["final_observation"][i]
             else:
@@ -126,6 +139,7 @@ class Agent:
 
 
 def batch_to_tensors(batch: list[Experience], device: torch.device) -> BatchTensors:
+    """Unpack a list of experiences into GPU-ready tensors."""
     states, actions, rewards, dones, new_state = [], [], [], [], []
     for e in batch:
         states.append(e.state)
@@ -145,6 +159,11 @@ def batch_to_tensors(batch: list[Experience], device: torch.device) -> BatchTens
 
 def calc_loss(batch: list[Experience], net: dqn_model.DQN, tgt_net: dqn_model.DQN,
               device: torch.device, gamma: float = GAMMA) -> torch.Tensor:
+    """Compute the DQN temporal-difference loss.
+
+    Uses the target network for bootstrap value estimation:
+    Q_target = r + gamma * max_a' Q_tgt(s', a')   (0 if terminal).
+    """
     states_t, actions_t, rewards_t, dones_t, new_states_t = batch_to_tensors(batch, device)
 
     with torch.autocast(device_type=device.type):
@@ -152,7 +171,6 @@ def calc_loss(batch: list[Experience], net: dqn_model.DQN, tgt_net: dqn_model.DQ
             1, actions_t.unsqueeze(-1)
         ).squeeze(-1)
         with torch.no_grad():
-            # Standard DQN: target net selects AND evaluates best action
             next_state_values = tgt_net(new_states_t).max(1)[0]
             next_state_values[dones_t] = 0.0
 
@@ -206,6 +224,7 @@ if __name__ == "__main__":
         epsilon = max(EPSILON_FINAL, EPSILON_START - frame_idx / EPSILON_DECAY_LAST_FRAME)
 
         episodes = agent.play_step(net, device, epsilon)
+        # update speed estimate when episodes finish
         if episodes:
             now = time.time()
             elapsed = now - ts
@@ -234,6 +253,7 @@ if __name__ == "__main__":
                 solved = True
                 break
 
+        # wait until buffer has enough samples before training
         if len(buffer) < REPLAY_START_SIZE:
             continue
 
@@ -244,7 +264,7 @@ if __name__ == "__main__":
         scaler.step(optimizer)
         scaler.update()
 
-        # Polyak averaging: soft update target network
+        # Polyak averaging: soft-update target network
         with torch.no_grad():
             for p, p_tgt in zip(net.parameters(), tgt_net.parameters()):
                 p_tgt.data.mul_(1 - TAU).add_(TAU * p.data)

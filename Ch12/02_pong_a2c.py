@@ -1,33 +1,120 @@
 #!/usr/bin/env python3
-import gymnasium as gym
-import ale_py
-import ptan
-from ptan.experience import VectorExperienceSourceFirstLast
-from ptan.common.utils import TBMeanTracker
-import numpy as np
+"""Advantage Actor-Critic (A2C) on Pong.
+
+On-policy algorithm that trains a shared-trunk network with separate
+policy (actor) and value (critic) heads.  Uses N parallel environments
+for variance reduction and n-step returns for faster credit assignment.
+"""
 import argparse
+import collections
+import time
+from dataclasses import dataclass
+
+import ale_py
+import gymnasium as gym
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.nn.utils as nn_utils
+import torch.optim as optim
+from gymnasium import spaces
+from gymnasium.wrappers import AtariPreprocessing
 from torch.utils.tensorboard.writer import SummaryWriter
 
-import torch
-import torch.nn.utils as nn_utils
-import torch.nn.functional as F
-import torch.optim as optim
+gym.register_envs(ale_py)
 
-from lib import common
-from ptan.common.wrappers import ImageToPyTorch, BufferWrapper
-from gymnasium.wrappers import AtariPreprocessing
-
+BATCH_SIZE = 128
+CLIP_GRAD = 0.1
+ENTROPY_BETA = 0.01        # weight for the entropy bonus in the loss
 GAMMA = 0.99
 LEARNING_RATE = 0.001
-ENTROPY_BETA = 0.01
-BATCH_SIZE = 128
-NUM_ENVS = 50
-
-REWARD_STEPS = 4
-CLIP_GRAD = 0.1
+MEAN_REWARD_BOUND = 19
+NUM_ENVS = 50              # parallel envs for on-policy variance reduction
+REWARD_STEPS = 4           # n-step return horizon
 
 
-def wrap_dqn(env, stack_frames=4, episodic_life=True, clip_reward=True, noop_max=0):
+class AtariA2C(nn.Module):
+    """Shared-trunk CNN with separate policy and value heads."""
+
+    def __init__(self, input_shape: tuple[int, ...], n_actions: int):
+        super(AtariA2C, self).__init__()
+
+        self.conv = nn.Sequential(
+            nn.Conv2d(input_shape[0], 32, kernel_size=8, stride=4),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),
+            nn.ReLU(),
+            nn.Flatten(),
+        )
+
+        size = self.conv(torch.zeros(1, *input_shape)).size()[-1]
+        self.policy = nn.Sequential(
+            nn.Linear(size, 512),
+            nn.ReLU(),
+            nn.Linear(512, n_actions)
+        )
+        self.value = nn.Sequential(
+            nn.Linear(size, 512),
+            nn.ReLU(),
+            nn.Linear(512, 1)
+        )
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        xx = x / 255
+        conv_out = self.conv(xx)
+        return self.policy(conv_out), self.value(conv_out)
+
+
+class ImageToPyTorch(gym.ObservationWrapper):
+    """Convert observations from HWC to CHW layout expected by PyTorch."""
+
+    def __init__(self, env):
+        super(ImageToPyTorch, self).__init__(env)
+        obs = self.observation_space
+        assert isinstance(obs, gym.spaces.Box)
+        assert len(obs.shape) == 3
+        new_shape = (obs.shape[-1], obs.shape[0], obs.shape[1])
+        self.observation_space = gym.spaces.Box(
+            low=obs.low.min(), high=obs.high.max(),
+            shape=new_shape, dtype=obs.dtype.type)
+
+    def observation(self, observation: np.ndarray) -> np.ndarray:
+        return np.moveaxis(observation, 2, 0)
+
+
+class BufferWrapper(gym.ObservationWrapper):
+    """Stack the last *n_steps* frames into a single observation."""
+
+    def __init__(self, env, n_steps):
+        super(BufferWrapper, self).__init__(env)
+        obs = env.observation_space
+        assert isinstance(obs, spaces.Box)
+        new_obs = gym.spaces.Box(
+            obs.low.repeat(n_steps, axis=0),
+            obs.high.repeat(n_steps, axis=0), dtype=obs.dtype.type)
+        self.observation_space = new_obs
+        self.buffer = collections.deque(maxlen=n_steps)
+
+    def reset(self, *, seed: int | None = None,
+              options: dict | None = None):
+        assert self.buffer.maxlen is not None
+        for _ in range(self.buffer.maxlen - 1):
+            obs_space = self.env.observation_space
+            assert isinstance(obs_space, spaces.Box)
+            self.buffer.append(obs_space.low)
+        obs, extra = self.env.reset(seed=seed, options=options)
+        return self.observation(obs), extra
+
+    def observation(self, observation: np.ndarray) -> np.ndarray:
+        self.buffer.append(observation)
+        return np.concatenate(self.buffer)
+
+
+def make_env(env, stack_frames=4, episodic_life=True, clip_reward=True, noop_max=0):
+    """Apply standard Atari preprocessing: downscale, grayscale, frame stack."""
     env = AtariPreprocessing(
         env, terminal_on_life_loss=episodic_life,
         grayscale_obs=True, grayscale_newaxis=True, scale_obs=False)
@@ -36,9 +123,178 @@ def wrap_dqn(env, stack_frames=4, episodic_life=True, clip_reward=True, noop_max
     return env
 
 
+@dataclass
+class Experience:
+    """A single n-step transition: first state, action taken, discounted
+    reward sum over n steps, and the state n steps later (None if terminal)."""
+    state: np.ndarray
+    action: int
+    reward: float
+    new_state: np.ndarray | None
+
+
+class NStepTracker:
+    """Accumulates per-environment transitions and emits n-step experiences.
+
+    Maintains a sliding window of (state, action, reward) tuples per env.
+    When the window is full, it collapses the entries into a single
+    Experience with a discounted reward sum.  On episode boundaries the
+    window is flushed so no transition crosses episode limits.
+    """
+
+    def __init__(self, n_envs: int, gamma: float, n_steps: int):
+        self.gamma = gamma
+        self.n_steps = n_steps
+        self.buffers: list[collections.deque] = [
+            collections.deque(maxlen=n_steps) for _ in range(n_envs)
+        ]
+
+    def _pack(self, buf: collections.deque, new_state: np.ndarray | None) -> Experience:
+        """Collapse buffered transitions into one n-step experience."""
+        reward = 0.0
+        for _, _, r in reversed(buf):
+            reward = r + self.gamma * reward
+        state, action, _ = buf[0]
+        return Experience(state=state, action=action, reward=reward,
+                                   new_state=new_state)
+
+    def step(self, env_idx: int, state: np.ndarray, action: int,
+             reward: float, done: bool, new_state: np.ndarray | None
+             ) -> list[Experience]:
+        """Record one transition; return completed n-step experiences (if any)."""
+        buf = self.buffers[env_idx]
+        buf.append((state, action, reward))
+        results: list[Experience] = []
+
+        if done:
+            # episode over — flush everything with no bootstrap state
+            while buf:
+                results.append(self._pack(buf, new_state=None))
+                buf.popleft()
+        elif len(buf) == self.n_steps:
+            results.append(self._pack(buf, new_state=new_state))
+            buf.popleft()
+
+        return results
+
+
+class Agent:
+    """Interacts with vectorized environments using the current policy."""
+
+    def __init__(self, env: gym.vector.VectorEnv, net: AtariA2C,
+                 device: torch.device, gamma: float, reward_steps: int):
+        self.env = env
+        self.net = net
+        self.device = device
+        self.n_envs = env.num_envs
+        self.tracker = NStepTracker(self.n_envs, gamma, reward_steps)
+        self.total_rewards = np.zeros(self.n_envs)
+        self.states, _ = self.env.reset()
+
+    @torch.no_grad()
+    def play_step(self) -> tuple[list[Experience], list[float]]:
+        """Advance all envs by one step; return new experiences and any finished episode rewards."""
+        states_t = torch.as_tensor(self.states, dtype=torch.float32).to(self.device)
+        logits_t, _ = self.net(states_t)
+        probs = F.softmax(logits_t, dim=1).cpu().numpy()
+
+        # sample actions from the policy distribution
+        actions = np.array([
+            np.random.choice(len(p), p=p) for p in probs
+        ])
+
+        new_states, rewards, is_done, is_tr, infos = self.env.step(actions)
+        self.total_rewards += rewards
+
+        experiences: list[Experience] = []
+        completed_rewards: list[float] = []
+
+        for i in range(self.n_envs):
+            done = bool(is_done[i]) or bool(is_tr[i])
+            # on termination the auto-reset overwrites new_states[i],
+            # so use final_observation to get the true last state
+            if done and "final_observation" in infos:
+                next_obs = infos["final_observation"][i]
+            else:
+                next_obs = new_states[i]
+
+            exps = self.tracker.step(
+                env_idx=i, state=self.states[i], action=int(actions[i]),
+                reward=float(rewards[i]), done=done, new_state=next_obs)
+            experiences.extend(exps)
+
+            if done:
+                completed_rewards.append(float(self.total_rewards[i]))
+                self.total_rewards[i] = 0.0
+
+        self.states = new_states
+        return experiences, completed_rewards
+
+
+def batch_to_tensors(batch: list[Experience], net: AtariA2C,
+                 device: torch.device, gamma: float, reward_steps: int):
+    """Convert a batch of n-step experiences into training tensors.
+
+    For non-terminal experiences the discounted n-step reward is
+    bootstrapped with V(s') from the current value head.
+    """
+    states = []
+    actions = []
+    rewards = []
+    not_done_idx = []
+    new_states = []
+    for idx, exp in enumerate(batch):
+        states.append(np.asarray(exp.state))
+        actions.append(int(exp.action))
+        rewards.append(exp.reward)
+        if exp.new_state is not None:
+            not_done_idx.append(idx)
+            new_states.append(np.asarray(exp.new_state))
+
+    states_t = torch.FloatTensor(np.asarray(states)).to(device)
+    actions_t = torch.LongTensor(actions).to(device)
+
+    # bootstrap non-terminal rewards with discounted value estimate
+    rewards_np = np.array(rewards, dtype=np.float32)
+    if not_done_idx:
+        new_states_t = torch.FloatTensor(np.asarray(new_states)).to(device)
+        last_vals_t = net(new_states_t)[1]
+        last_vals_np = last_vals_t.data.cpu().numpy()[:, 0]
+        last_vals_np *= gamma ** reward_steps
+        rewards_np[not_done_idx] += last_vals_np
+
+    ref_vals_t = torch.FloatTensor(rewards_np).to(device)
+    return states_t, actions_t, ref_vals_t
+
+
+def calc_loss(net: AtariA2C, states_t: torch.Tensor, actions_t: torch.Tensor,
+              vals_ref_t: torch.Tensor, entropy_beta: float = ENTROPY_BETA
+              ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor,
+                         torch.Tensor, torch.Tensor]:
+    """Compute the three A2C loss components.
+
+    Returns (policy_loss, value_loss, entropy_loss, advantage, values).
+    The policy loss uses the advantage (ref_values - V(s)) to weight
+    log-probabilities.  The entropy bonus encourages exploration.
+    """
+    logits_t, value_t = net(states_t)
+    loss_value_t = F.mse_loss(value_t.squeeze(-1), vals_ref_t)
+
+    log_prob_t = F.log_softmax(logits_t, dim=1)
+    adv_t = vals_ref_t - value_t.squeeze(-1).detach()
+    log_act_t = log_prob_t[range(len(states_t)), actions_t]
+    log_prob_actions_t = adv_t * log_act_t
+    loss_policy_t = -log_prob_actions_t.mean()
+
+    prob_t = F.softmax(logits_t, dim=1)
+    entropy_loss_t = entropy_beta * (prob_t * log_prob_t).sum(dim=1).mean()
+
+    return loss_policy_t, loss_value_t, entropy_loss_t, adv_t, value_t
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dev", default="cuda", help="Device to use, default=cpu")
+    parser.add_argument("--dev", default="cuda", help="Device to use, default=cuda")
     parser.add_argument("--use-async", default=False, action='store_true',
                         help="Use async vector env (A3C mode)")
     parser.add_argument("-n", "--name", required=True, help="Name of the run")
@@ -46,7 +302,7 @@ if __name__ == "__main__":
     device = torch.device(args.dev)
 
     env_factories = [
-        lambda: wrap_dqn(gym.make("ALE/Pong-v5", frameskip=1))
+        lambda: make_env(gym.make("ALE/Pong-v5", frameskip=1))
         for _ in range(NUM_ENVS)
     ]
     if args.use_async:
@@ -55,71 +311,93 @@ if __name__ == "__main__":
         env = gym.vector.SyncVectorEnv(env_factories)
     writer = SummaryWriter(comment="-pong-a2c_" + args.name)
 
-    net = common.AtariA2C(env.single_observation_space.shape,
-                          env.single_action_space.n).to(device)
+    obs_shape = env.single_observation_space.shape
+    assert obs_shape is not None
+    act_space = env.single_action_space
+    assert isinstance(act_space, gym.spaces.Discrete)
+    net = AtariA2C(obs_shape, int(act_space.n)).to(device)
     print(net)
 
-    agent = ptan.agent.PolicyAgent(lambda x: net(x)[0], apply_softmax=True, device=device)
-    exp_source = VectorExperienceSourceFirstLast(
-        env, agent, gamma=GAMMA, steps_count=REWARD_STEPS)
-
+    agent = Agent(env, net, device, gamma=GAMMA, reward_steps=REWARD_STEPS)
     optimizer = optim.Adam(net.parameters(), lr=LEARNING_RATE, eps=1e-3)
 
-    batch = []
+    batch: list[Experience] = []
+    total_rewards: list[float] = []
+    frame_idx = 0
+    ts_frame = 0
+    ts = time.time()
+    start_ts = ts
+    best_m_reward = None
+    speed = 0.0
+    solved = False
 
-    with common.RewardTracker(writer, stop_reward=18) as tracker:
-        with TBMeanTracker(writer, batch_size=10) as tb_tracker:
-            for step_idx, exp in enumerate(exp_source):
-                batch.append(exp)
+    while not solved:
+        exps, completed_rewards = agent.play_step()
+        frame_idx += NUM_ENVS
 
-                # handle new rewards
-                new_rewards = exp_source.pop_total_rewards()
-                if new_rewards:
-                    if tracker.reward(new_rewards[0], step_idx):
-                        break
+        batch.extend(exps)
 
-                if len(batch) < BATCH_SIZE:
-                    continue
+        # update speed estimate when episodes finish
+        if completed_rewards:
+            now = time.time()
+            elapsed = now - ts
+            if elapsed > 0:
+                speed = (frame_idx - ts_frame) / elapsed
+            ts_frame = frame_idx
+            ts = now
+        for reward in completed_rewards:
+            total_rewards.append(reward)
+            m_reward = np.mean(total_rewards[-100:])
+            elapsed = time.strftime("%H:%M:%S", time.gmtime(time.time() - start_ts))
+            print(f"{elapsed} {frame_idx}: done {len(total_rewards)} games, "
+                  f"reward {m_reward:.3f}, speed {speed:.2f} f/s")
+            writer.add_scalar("speed", speed, frame_idx)
+            writer.add_scalar("reward_100", m_reward, frame_idx)
+            writer.add_scalar("reward", reward, frame_idx)
+            if best_m_reward is None or best_m_reward < m_reward:
+                torch.save(net.state_dict(), "pong-a2c.dat")
+                if best_m_reward is not None:
+                    print(f"Best reward updated {best_m_reward:.3f} -> {m_reward:.3f}")
+                best_m_reward = m_reward
+            if m_reward > MEAN_REWARD_BOUND:
+                print("Solved in %d frames!" % frame_idx)
+                solved = True
+                break
 
-                states_t, actions_t, vals_ref_t = common.unpack_batch(
-                    batch, net, device=device, gamma=GAMMA, reward_steps=REWARD_STEPS)
-                batch.clear()
+        if len(batch) < BATCH_SIZE:
+            continue
 
-                optimizer.zero_grad()
-                logits_t, value_t = net(states_t)
-                loss_value_t = F.mse_loss(value_t.squeeze(-1), vals_ref_t)
+        states_t, actions_t, vals_ref_t = batch_to_tensors(
+            batch, net, device=device, gamma=GAMMA, reward_steps=REWARD_STEPS)
+        batch.clear()
 
-                log_prob_t = F.log_softmax(logits_t, dim=1)
-                adv_t = vals_ref_t - value_t.detach()
-                log_act_t = log_prob_t[range(BATCH_SIZE), actions_t]
-                log_prob_actions_t = adv_t * log_act_t
-                loss_policy_t = -log_prob_actions_t.mean()
+        optimizer.zero_grad()
+        loss_policy_t, loss_value_t, entropy_loss_t, adv_t, value_t = calc_loss(
+            net, states_t, actions_t, vals_ref_t)
 
-                prob_t = F.softmax(logits_t, dim=1)
-                entropy_loss_t = ENTROPY_BETA * (prob_t * log_prob_t).sum(dim=1).mean()
+        # two-phase backward: first policy alone (to capture its gradient
+        # norms for logging), then entropy + value on top
+        loss_policy_t.backward(retain_graph=True)
+        grads = np.concatenate([
+            p.grad.data.cpu().numpy().flatten()
+            for p in net.parameters() if p.grad is not None
+        ])
 
-                # calculate policy gradients only
-                loss_policy_t.backward(retain_graph=True)
-                grads = np.concatenate([
-                    p.grad.data.cpu().numpy().flatten()
-                    for p in net.parameters() if p.grad is not None
-                ])
+        loss_v = entropy_loss_t + loss_value_t
+        loss_v.backward()
+        nn_utils.clip_grad_norm_(net.parameters(), CLIP_GRAD)
+        optimizer.step()
+        loss_v += loss_policy_t  # total loss for logging only
 
-                # apply entropy and value gradients
-                loss_v = entropy_loss_t + loss_value_t
-                loss_v.backward()
-                nn_utils.clip_grad_norm_(net.parameters(), CLIP_GRAD)
-                optimizer.step()
-                # get full loss
-                loss_v += loss_policy_t
+        writer.add_scalar("advantage", adv_t.mean().item(), frame_idx)
+        writer.add_scalar("values", value_t.mean().item(), frame_idx)
+        writer.add_scalar("batch_rewards", vals_ref_t.mean().item(), frame_idx)
+        writer.add_scalar("loss_entropy", entropy_loss_t.item(), frame_idx)
+        writer.add_scalar("loss_policy", loss_policy_t.item(), frame_idx)
+        writer.add_scalar("loss_value", loss_value_t.item(), frame_idx)
+        writer.add_scalar("loss_total", loss_v.item(), frame_idx)
+        writer.add_scalar("grad_l2", np.sqrt(np.mean(np.square(grads))), frame_idx)
+        writer.add_scalar("grad_max", np.max(np.abs(grads)), frame_idx)
+        writer.add_scalar("grad_var", np.var(grads), frame_idx)
 
-                tb_tracker.track("advantage", adv_t, step_idx)
-                tb_tracker.track("values", value_t, step_idx)
-                tb_tracker.track("batch_rewards", vals_ref_t, step_idx)
-                tb_tracker.track("loss_entropy", entropy_loss_t, step_idx)
-                tb_tracker.track("loss_policy", loss_policy_t, step_idx)
-                tb_tracker.track("loss_value", loss_value_t, step_idx)
-                tb_tracker.track("loss_total", loss_v, step_idx)
-                tb_tracker.track("grad_l2", np.sqrt(np.mean(np.square(grads))), step_idx)
-                tb_tracker.track("grad_max", np.max(np.abs(grads)), step_idx)
-                tb_tracker.track("grad_var", np.var(grads), step_idx)
+    writer.close()
