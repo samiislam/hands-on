@@ -1,30 +1,17 @@
 #!/usr/bin/env python3
 import gymnasium as gym
-import ale_py
 import argparse
 import numpy as np
 import collections
 
 import torch
 
-from gymnasium.wrappers import AtariPreprocessing
-import importlib
-_a2c = importlib.import_module("02_pong_a2c")
-AtariA2C = _a2c.AtariA2C
-ImageToPyTorch = _a2c.ImageToPyTorch
-BufferWrapper = _a2c.BufferWrapper
+from lib import a2c_model
+from lib import wrappers
 
+AtariA2C = a2c_model.AtariA2C
 
 DEFAULT_ENV_NAME = "ALE/Pong-v5"
-
-
-def make_env(env, stack_frames=4, episodic_life=True, clip_reward=True, noop_max=0):
-    env = AtariPreprocessing(
-        env, terminal_on_life_loss=episodic_life,
-        grayscale_obs=True, grayscale_newaxis=True, scale_obs=False)
-    env = ImageToPyTorch(env)
-    env = BufferWrapper(env, stack_frames)
-    return env
 
 
 if __name__ == "__main__":
@@ -35,7 +22,7 @@ if __name__ == "__main__":
     parser.add_argument("-r", "--record", required=True, help="Directory for video")
     args = parser.parse_args()
 
-    env = make_env(gym.make(args.env, frameskip=1, render_mode="rgb_array"),
+    env = wrappers.make_env(gym.make(args.env, frameskip=1, render_mode="rgb_array"),
                    episodic_life=False)
     env = gym.wrappers.RecordVideo(env, video_folder=args.record)
 

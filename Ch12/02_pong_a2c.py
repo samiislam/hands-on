@@ -10,19 +10,16 @@ import collections
 import time
 from dataclasses import dataclass
 
-import ale_py
 import gymnasium as gym
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.utils as nn_utils
 import torch.optim as optim
-from gymnasium import spaces
-from gymnasium.wrappers import AtariPreprocessing
 from torch.utils.tensorboard.writer import SummaryWriter
 
-gym.register_envs(ale_py)
+from lib import a2c_model
+from lib import wrappers
 
 BATCH_SIZE = 128
 CLIP_GRAD = 0.1
@@ -34,95 +31,6 @@ NUM_ENVS = 50              # parallel envs for on-policy variance reduction
 REWARD_STEPS = 4           # n-step return horizon
 
 
-class AtariA2C(nn.Module):
-    """Shared-trunk CNN with separate policy and value heads."""
-
-    def __init__(self, input_shape: tuple[int, ...], n_actions: int):
-        super(AtariA2C, self).__init__()
-
-        self.conv = nn.Sequential(
-            nn.Conv2d(input_shape[0], 32, kernel_size=8, stride=4),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=4, stride=2),
-            nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, stride=1),
-            nn.ReLU(),
-            nn.Flatten(),
-        )
-
-        size = self.conv(torch.zeros(1, *input_shape)).size()[-1]
-        self.policy = nn.Sequential(
-            nn.Linear(size, 512),
-            nn.ReLU(),
-            nn.Linear(512, n_actions)
-        )
-        self.value = nn.Sequential(
-            nn.Linear(size, 512),
-            nn.ReLU(),
-            nn.Linear(512, 1)
-        )
-
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        xx = x / 255
-        conv_out = self.conv(xx)
-        return self.policy(conv_out), self.value(conv_out)
-
-
-class ImageToPyTorch(gym.ObservationWrapper):
-    """Convert observations from HWC to CHW layout expected by PyTorch."""
-
-    def __init__(self, env):
-        super(ImageToPyTorch, self).__init__(env)
-        obs = self.observation_space
-        assert isinstance(obs, gym.spaces.Box)
-        assert len(obs.shape) == 3
-        new_shape = (obs.shape[-1], obs.shape[0], obs.shape[1])
-        self.observation_space = gym.spaces.Box(
-            low=obs.low.min(), high=obs.high.max(),
-            shape=new_shape, dtype=obs.dtype.type)
-
-    def observation(self, observation: np.ndarray) -> np.ndarray:
-        return np.moveaxis(observation, 2, 0)
-
-
-class BufferWrapper(gym.ObservationWrapper):
-    """Stack the last *n_steps* frames into a single observation."""
-
-    def __init__(self, env, n_steps):
-        super(BufferWrapper, self).__init__(env)
-        obs = env.observation_space
-        assert isinstance(obs, spaces.Box)
-        new_obs = gym.spaces.Box(
-            obs.low.repeat(n_steps, axis=0),
-            obs.high.repeat(n_steps, axis=0), dtype=obs.dtype.type)
-        self.observation_space = new_obs
-        self.buffer = collections.deque(maxlen=n_steps)
-
-    def reset(self, *, seed: int | None = None,
-              options: dict | None = None):
-        assert self.buffer.maxlen is not None
-        for _ in range(self.buffer.maxlen - 1):
-            obs_space = self.env.observation_space
-            assert isinstance(obs_space, spaces.Box)
-            self.buffer.append(obs_space.low)
-        obs, extra = self.env.reset(seed=seed, options=options)
-        return self.observation(obs), extra
-
-    def observation(self, observation: np.ndarray) -> np.ndarray:
-        self.buffer.append(observation)
-        return np.concatenate(self.buffer)
-
-
-def make_env(env, stack_frames=4, episodic_life=True, clip_reward=True, noop_max=0):
-    """Apply standard Atari preprocessing: downscale, grayscale, frame stack."""
-    env = AtariPreprocessing(
-        env, terminal_on_life_loss=episodic_life,
-        grayscale_obs=True, grayscale_newaxis=True, scale_obs=False)
-    env = ImageToPyTorch(env)
-    env = BufferWrapper(env, stack_frames)
-    return env
-
-
 @dataclass
 class Experience:
     """A single n-step transition: first state, action taken, discounted
@@ -131,6 +39,9 @@ class Experience:
     action: int
     reward: float
     new_state: np.ndarray | None
+
+
+AtariA2C = a2c_model.AtariA2C
 
 
 class NStepTracker:
@@ -302,7 +213,7 @@ if __name__ == "__main__":
     device = torch.device(args.dev)
 
     env_factories = [
-        lambda: make_env(gym.make("ALE/Pong-v5", frameskip=1))
+        lambda: wrappers.make_env(gym.make("ALE/Pong-v5", frameskip=1))
         for _ in range(NUM_ENVS)
     ]
     if args.use_async:
